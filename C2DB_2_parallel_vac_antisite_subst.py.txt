@@ -1,0 +1,255 @@
+__author__ = 'dchakraborty'
+
+
+from pymongo import MongoClient
+from bson.json_util import dumps
+
+import sys, os, glob, shutil
+from pymatgen.analysis.defects.core import Vacancy, Substitution, Interstitial
+from pymatgen.analysis.defects.generators import VacancyGenerator, SubstitutionGenerator, \
+                    InterstitialGenerator,SimpleChargeGenerator,VoronoiInterstitialGenerator
+from pymatgen.io.vasp import Poscar
+from pymatgen.io.cif import CifWriter
+from pymatgen.ext.matproj import MPRester
+from pymatgen.core import PeriodicSite
+from pymatgen.core import periodic_table
+from string import digits
+from pymatgen.core.structure import Structure
+from pymatgen.core.periodic_table import Element
+
+from monty.serialization import dumpfn, loadfn
+
+import json
+
+import multiprocessing as mp
+from multiprocessing import Process
+
+#print("Number of processors: ", mp.cpu_count())
+#num_cores=mp.cpu_count()
+
+basepath=os.getcwd()
+print(basepath)
+#
+#remove previous directories
+for i in os.listdir():
+	if os.path.isdir(i): shutil.rmtree(i) 
+
+
+
+#Open the database
+client = MongoClient('localhost', 6004)
+client.admin.authenticate('readUser', 'qiminyan',mechanism='SCRAM-SHA-1', source='2dMat_from_cmr_fysik')
+db = client['2dMat_from_cmr_fysik']
+collection = db['2dMaterial_v1']
+
+
+def defect_vacancy(struct):
+	defects_to_run=[]
+	for vac_defect in VacancyGenerator(struct):	
+		print("\tCreated Defect {} at site {}".format( vac_defect.name, vac_defect.site))
+		for charged_defect in SimpleChargeGenerator( vac_defect):
+			print("\tcreated defect with charge {}".format( charged_defect.charge))
+			defects_to_run.append(charged_defect.copy())
+			charged_vac_data= open('%s-chg(%s).cif'%(vac_defect.name,charged_defect.charge),'w')
+			charged_defect_str=charged_defect.generate_defect_structure( supercell=(6, 6, 1))
+			charged_vac_data.writelines(str(CifWriter(charged_defect_str)))
+			charged_vac_data.close()
+
+
+def defect_substitution(struct,element,subtype):
+       defects_to_run=[]
+       for sub_defect in SubstitutionGenerator(struct, element):
+       	print("\tCreated Defect {} at site {}".format( sub_defect.name, sub_defect.site))
+       	for charged_defect in SimpleChargeGenerator( sub_defect):
+       		print("\tcreated defect with charge {}".format( charged_defect.charge))
+       		defects_to_run.append( charged_defect.copy())
+
+       		if (subtype=="substitution") :
+       			charged_sub_data= open('%s-chg(%s).cif'%(sub_defect.name,charged_defect.charge),'w')
+       		elif (subtype=="antisite"):
+       			charged_sub_data= open('antisite-%s-chg(%s).cif'%(sub_defect.name,charged_defect.charge),'w')
+       			
+       		charged_defect_str=charged_defect.generate_defect_structure( supercell=(6, 6, 1))
+       		charged_sub_data.writelines(str(CifWriter(charged_defect_str)))
+       		charged_sub_data.close()
+
+
+def defect_inter(struct,element,int_type):
+	defects_to_run=[]
+	for inter_defect in InterstitialGenerator(struct, element):
+		print("\tCreated Defect {} at site {}".format( inter_defect.name, inter_defect.site))
+		for charged_defect in SimpleChargeGenerator( inter_defect):
+			print("\tcreated defect with charge {}".format( charged_defect.charge))
+			defects_to_run.append( charged_defect.copy())
+
+			if int_type=="extrinsic":
+				charged_inter_data= open('ext-%s-chg(%s).cif'%(inter_defect.name,charged_defect.charge),'w')
+			elif int_type=="intrinsic":
+				charged_inter_data= open('int-%s-chg(%s).cif'%(inter_defect.name,charged_defect.charge),'w')
+
+			charged_defect_str=charged_defect.generate_defect_structure( supercell=(6, 6, 1))
+			charged_inter_data.writelines(str(CifWriter(charged_defect_str)))
+			charged_inter_data.close()
+
+
+def find_compounds(uid):
+	print(uid)
+	query = collection.find({"uid":"%s"%(uid)})
+	elements=[]
+	for doc in query:
+		chem_form = [doc["uid"]]
+		struc = [doc["structure"]]
+		struc_id = [doc["_id"]]
+		struc_id = struc_id[0]
+	print("chemical_formula", chem_form)
+	print("id",struc_id)
+	#print("strucutre", struc)
+	
+	#Creating directories with C2DB-ids
+	
+	str_file=os.path.join(os.path.join(basepath,'%s')%(struc_id))
+	str_file_exists=os.path.exists(str_file)
+	if not str_file_exists: os.mkdir(str_file)
+	os.chdir(str_file)
+	
+	#Get the elements
+	species=[]
+	for item in struc[0].items():
+		species.append(item)
+	struc_label=species[4][1]
+	for i in range(len(struc_label)):
+		elements.append(struc_label[i]['label'])
+	elements = list(set(elements))
+	print("element_list", elements)
+	
+	#Print out the structure to *.json file(s)
+	 
+	list_query=list(struc)
+	#print(list_query[0])
+	
+	dumpfn(list_query[0],'%s.json'%(chem_form))
+	
+	#Read the data from *.json file
+	
+	no_defect_data = open('undefected_data.dat','w')				
+	two_dim_struct=Structure.from_dict(json.load(open("%s.json"%(chem_form),'r')))
+	print(two_dim_struct)
+	no_defect_data.writelines(str(CifWriter(two_dim_struct)))
+	os.rename('undefected_data.dat','%s.cif'%(chem_form))
+	
+	#Creating vacancies with the 2-D structure formula
+	
+	print('Vacancy Generator:')
+
+	vac_result=defect_vacancy(two_dim_struct)
+	
+	#Creating substitution and antisite with the 2-D structure formula
+
+	print('Substitution Generator:')
+
+
+	sub_element_list=['H', 'Li'] #, 'Be', 'B', 'C', 'N', 'O', 'F', 'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl']
+	for ele in elements[:]:
+		if ele in sub_element_list:
+			print(ele)
+			sub_element_list.remove(ele)
+	print(sub_element_list)
+	
+	for element in sub_element_list:
+		substitution_result=defect_substitution(two_dim_struct,element,"substitution")
+
+	
+	print('Antisite Generator:')
+
+	for element in elements:
+		antisite_result=defect_substitution(two_dim_struct,element,"antisite")
+	
+	
+	#Creating Extrinsic and Intrinsic interstitials with the bulk structure formula
+	
+#	print('Extrinsic Interstitial Generator:')
+#
+#	sub_element_list=['H', 'Li'] #, 'Be', 'B', 'C', 'N', 'O', 'F', 'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl']
+#	for ele in elements[:]:
+#		if ele in sub_element_list:
+#			print(ele)
+#			sub_element_list.remove(ele)
+#	print(sub_element_list)
+#
+#	
+#	for element in sub_element_list:
+#		extrinsic_result=defect_inter(two_dim_struct,element,"extrinsic")
+#	
+#	#extrinsic_result=pool.apply(defect_inter(two_dim_struct,element,"extrinsic") for element in sub_element_list)
+#	#extrinsic_result=Parallel(n_jobs=num_cores)(delayed(defect_inter)(two_dim_struct,element,"extrinsic") for element in sub_element_list)
+#		
+#	print('Intrinsic Interstitial Generator:')
+#	
+#	for element in elements:
+#		intrinsic_result=defect_inter(two_dim_struct,element,"intrinsic")
+#
+#	#intrinsic_result=pool.apply(defect_inter(two_dim_struct,element,"intrinsic") for element in elements)
+#	#intrinsic_result=Parallel(n_jobs=num_cores)(delayed(defect_inter)(two_dim_struct,element,"intrinsic") for element in elements)
+		
+
+	os.rename(os.path.join(os.path.join(basepath,'%s')%(struc_id)),os.path.join(basepath,'%s'+'-'+'%s')%(struc_id,chem_form))
+       
+	#pool.close()
+
+
+def query():
+
+	pool=mp.Pool(mp.cpu_count())
+
+	ids=[]
+	formulas=[]
+	for doc in collection.find():
+		iden = [doc["_id"]]
+		ids.append(iden[0])
+		formula = [doc["uid"]]
+		formulas.append(formula[0])
+
+	seen = {}
+	dupes = []
+	for iden in ids:
+	    if iden not in seen:
+	         seen[iden] = 1
+	    else:	
+	         if seen[iden] ==1 :
+	               dupes.append(iden)
+	         seen[iden] +=1
+	
+	print(len(dupes))
+	print(len(seen))
+
+
+	result=pool.map(find_compounds, formulas)
+	
+	#print(result)
+
+	pool.close()
+
+
+if __name__ == '__main__':
+	print("Number of processors: ", mp.cpu_count())
+	num_cores=mp.cpu_count()
+
+#	basepath=os.getcwd()
+#	print(basepath)
+#
+#	#remove previous directories
+#	for i in os.listdir():
+#		if os.path.isdir(i): shutil.rmtree(i) 
+	
+	#Open the database
+	#client = MongoClient('localhost', 6002)
+	#client.admin.authenticate('readUser', 'qiminyan',mechanism='SCRAM-SHA-1', source='2dMat_from_cmr_fysik')
+	#db = client['2dMat_from_cmr_fysik']
+	#collection = db['2dMaterial_v1']
+	
+	example=collection.find_one()
+	print(example)
+
+	mp.freeze_support()
+	
+	query()	
